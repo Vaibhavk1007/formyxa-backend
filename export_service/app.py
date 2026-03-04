@@ -917,7 +917,15 @@ def render_node(node, document: Document, signatory: Optional[dict] = None):
         attrs   = node.get("attrs", {}) or {}
         if attrs.get("instructional"): return
         content = node.get("content", []) or []
-        if not any(c.get("type") == "text" and c.get("text", "").strip() for c in content): return
+        if not content:
+            return
+        has_text = any(
+            c.get("type") == "text" and c.get("text", "").strip()
+            for c in content
+        )
+        has_inline = any(c.get("type") in ("formyxaField", "hardBreak") for c in content)
+        if not has_text and not has_inline:
+            return
         p = document.add_paragraph()
         add_text_runs_from_tiptap(content, p)
         apply_body_spacing(p)
@@ -938,7 +946,9 @@ def render_node(node, document: Document, signatory: Optional[dict] = None):
             for i, child in enumerate(paras):
                 if (child.get("attrs") or {}).get("instructional"): continue
                 content = child.get("content", []) or []
-                if not any(c.get("type") == "text" and c.get("text", "").strip() for c in content): continue
+                if not content or not any(c.get("type") == "text" and c.get("text", "").strip() for c in content):
+                if not any(c.get("type") == "formyxaField" for c in content):
+                    continue
                 p = document.add_paragraph()
                 if i == 0:
                     br = p.add_run("•  ")
@@ -967,7 +977,9 @@ def render_node(node, document: Document, signatory: Optional[dict] = None):
             for i, child in enumerate(paras):
                 if (child.get("attrs") or {}).get("instructional"): continue
                 content = child.get("content", []) or []
-                if not any(c.get("type") == "text" and c.get("text", "").strip() for c in content): continue
+                if not content or not any(c.get("type") == "text" and c.get("text", "").strip() for c in content):
+                if not any(c.get("type") == "formyxaField" for c in content):
+                    continue
                 p = document.add_paragraph()
                 if i == 0:
                     nr = p.add_run(f"{idx}.  ")
