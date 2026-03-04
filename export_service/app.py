@@ -6,6 +6,7 @@
 # .env:
 #   HANDW_API_BASE=http://localhost:8000
 #   FLASK_DOCX_URL=http://localhost:8000/generate-docx
+#   REDIS_URL=redis://...   ← ADD THIS (from Render Redis dashboard)
 # =============================================================
 
 import os
@@ -20,6 +21,7 @@ import fitz          # PyMuPDF
 import time
 import numpy as np
 import cv2
+import redis as redis_lib          # ← CHANGE 1: added
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
@@ -47,7 +49,7 @@ load_dotenv()
 ENGINE_VERSION     = "v2.0.0"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "openai/gpt-4o"  # upgrade from gpt-4o-mini
+MODEL = "openai/gpt-4o"
 MAX_PDF_PAGES      = 20
 
 OCR_HEADERS = {
@@ -88,10 +90,8 @@ app.add_middleware(
 
 @app.middleware("http")
 async def api_key_guard(request: Request, call_next):
-    # Always allow docs
     if request.url.path in ["/docs", "/openapi.json", "/redoc"]:
         return await call_next(request)
-    # Guard both /api/* routes AND /generate-docx
     if request.url.path.startswith("/api") or request.url.path == "/generate-docx":
         key = request.headers.get("x-api-key")
         if not API_KEY or key != API_KEY:
@@ -100,18 +100,37 @@ async def api_key_guard(request: Request, call_next):
 
 
 # ─────────────────────────────────────────────────────────────
-# JOB STORE  (in-memory)
+# CHANGE 2: JOB STORE — Redis (replaces in-memory dict)
+# Survives cold starts and works across multiple Render instances.
 # ─────────────────────────────────────────────────────────────
 
-JOB_STORE: dict = {}
+JOB_TTL = 60 * 60 * 3  # 3 hours — jobs auto-expire
+
+def _get_redis():
+    url = os.getenv("REDIS_URL")
+    if not url:
+        raise RuntimeError("REDIS_URL env var not set")
+    return redis_lib.from_url(url, decode_responses=True)
 
 def load_job(jobId: str):
-    return JOB_STORE.get(jobId)
+    try:
+        r = _get_redis()
+        raw = r.get(f"job:{jobId}")
+        return json.loads(raw) if raw else None
+    except Exception as e:
+        log("⚠️ Redis load_job error", repr(e))
+        return None
 
 def update_job(jobId: str, **updates):
-    if jobId not in JOB_STORE:
-        JOB_STORE[jobId] = {"jobId": jobId}
-    JOB_STORE[jobId].update(updates)
+    try:
+        r = _get_redis()
+        key = f"job:{jobId}"
+        raw = r.get(key)
+        existing = json.loads(raw) if raw else {"jobId": jobId}
+        existing.update(updates)
+        r.setex(key, JOB_TTL, json.dumps(existing))
+    except Exception as e:
+        log("⚠️ Redis update_job error", repr(e))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -129,10 +148,6 @@ def log(step, data=None):
 # ░░░░  SECTION 1 — OCR / VISION PIPELINE  ░░░░░░░░░░░░░░░░░░
 # =============================================================
 
-# ─────────────────────────────────────────────────────────────
-# PDF / IMAGE UTILITIES
-# ─────────────────────────────────────────────────────────────
-
 def is_pdf(data: bytes) -> bool:
     return data[:4] == b"%PDF"
 
@@ -149,7 +164,6 @@ def pdf_page_to_image_bytes(page) -> bytes:
 
 
 def pdf_to_image_bytes(pdf_bytes: bytes) -> bytes:
-    """Render all pages (up to MAX_PDF_PAGES) and stitch vertically into one PNG."""
     doc         = fitz.open(stream=pdf_bytes, filetype="pdf")
     total_pages = min(len(doc), MAX_PDF_PAGES)
     log("PDF pages to render", f"{total_pages} / {len(doc)}")
@@ -194,45 +208,38 @@ def to_png_bytes(raw_bytes: bytes) -> bytes:
     return buf.tobytes()
 
 
-# ─────────────────────────────────────────────────────────────
-# STAGE 1 — VISUAL ANCHOR
-# ─────────────────────────────────────────────────────────────
-
 def stage1_extract_markdown(image_bytes: bytes) -> str:
     log("STAGE 1 — Google Vision OCR")
     t0 = time.time()
-    
-    # Call Google Vision API directly via REST (no SDK needed)
-    import base64
+
     api_key = os.getenv("GOOGLE_VISION_API_KEY")
     if not api_key:
         raise RuntimeError("GOOGLE_VISION_API_KEY not set")
-    
+
     b64 = base64.b64encode(image_bytes).decode("utf-8")
-    
+
     payload = {
         "requests": [{
             "image": {"content": b64},
             "features": [{"type": "DOCUMENT_TEXT_DETECTION"}]
         }]
     }
-    
+
     res = requests.post(
         f"https://vision.googleapis.com/v1/images:annotate?key={api_key}",
         json=payload,
         timeout=60
     )
     res.raise_for_status()
-    
-    result     = res.json()
-    raw_text   = result["responses"][0].get("fullTextAnnotation", {}).get("text", "")
-    
+
+    result   = res.json()
+    raw_text = result["responses"][0].get("fullTextAnnotation", {}).get("text", "")
+
     if not raw_text.strip():
         raise ValueError("Google Vision returned empty text")
-    
+
     log("STAGE 1 Vision done", f"{round(time.time()-t0, 2)}s | {len(raw_text)} chars")
-    
-    # Now pass raw text to GPT for FORMATTING ONLY — not reading
+
     prompt = f"""Convert this already-extracted text into clean Markdown.
 
 CRITICAL RULES:
@@ -261,10 +268,6 @@ EXTRACTED TEXT:
     log("STAGE 1 formatting done", f"{round(time.time()-t0, 2)}s | {len(result2)} chars")
     return result2
 
-
-# ─────────────────────────────────────────────────────────────
-# STAGE 2 — AUDITOR
-# ─────────────────────────────────────────────────────────────
 
 def extract_json_safe(text: str) -> dict:
     text = re.sub(r"^```(?:json)?\s*", "", text.strip())
@@ -332,10 +335,6 @@ Return ONLY this exact JSON (no extra text, no code fences):
     return result
 
 
-# ─────────────────────────────────────────────────────────────
-# STAGE 3 — TIPTAP JSON
-# ─────────────────────────────────────────────────────────────
-
 def stage3_to_tiptap(markdown: str) -> dict:
     log("STAGE 3 — TipTap JSON")
     t0 = time.time()
@@ -371,16 +370,7 @@ MARKDOWN:
     return doc
 
 
-# ─────────────────────────────────────────────────────────────
-# PIPELINE ORCHESTRATOR
-# ─────────────────────────────────────────────────────────────
-
 def strip_truncated(markdown: str) -> str:
-    """
-    Hard enforcement: cut everything at and after [DOCUMENT TRUNCATED].
-    Also trims any trailing sentence that ends with an em-dash or mid-word,
-    which are tell-tale signs of fabricated completions.
-    """
     marker = "[DOCUMENT TRUNCATED]"
     if marker in markdown:
         markdown = markdown[:markdown.index(marker)].rstrip()
@@ -397,7 +387,6 @@ def parse_document(image_bytes: bytes) -> dict:
         if not raw_markdown.strip():
             raise ValueError("Stage 1 returned empty markdown")
 
-        # Hard-strip any truncation marker before auditing
         raw_markdown = strip_truncated(raw_markdown)
 
         audit             = stage2_audit(raw_markdown)
@@ -406,7 +395,6 @@ def parse_document(image_bytes: bytes) -> dict:
         if not verified_markdown.strip():
             verified_markdown = raw_markdown
 
-        # Hard-strip again in case auditor reintroduced or missed the marker
         verified_markdown = strip_truncated(verified_markdown)
 
         doc           = stage3_to_tiptap(verified_markdown)
@@ -433,12 +421,12 @@ def run_ocr_job(jobId: str):
         log("JOB START", jobId)
         job = load_job(jobId)
         if not job:
-            raise RuntimeError("Job not found")
+            raise RuntimeError("Job not found in Redis — possible cold start race condition")
         update_job(jobId, state="processing")
 
         file_path = job.get("filePath")
         if not file_path or not os.path.exists(file_path):
-            raise RuntimeError("File path missing or invalid")
+            raise RuntimeError(f"File not found: {file_path!r}")
 
         with open(file_path, "rb") as f:
             raw_bytes = f.read()
@@ -449,17 +437,16 @@ def run_ocr_job(jobId: str):
         update_job(jobId, state="ready", contentJson=document)
         log("JOB DONE", jobId)
     except Exception as e:
-        log("JOB ERROR", repr(e))
-        update_job(jobId, state="error")
+        # CHANGE 3: store actual error so frontend can display it
+        error_detail = repr(e)
+        log("JOB ERROR", error_detail)
+        traceback.print_exc()
+        update_job(jobId, state="error", detail=error_detail)
 
 
 # =============================================================
 # ░░░░  SECTION 2 — DOCX EXPORT ENGINE  ░░░░░░░░░░░░░░░░░░░░░
 # =============================================================
-
-# ─────────────────────────────────────────────────────────────
-# TYPOGRAPHY
-# ─────────────────────────────────────────────────────────────
 
 BODY_FONT = "Times New Roman"
 BODY_SIZE = 12
@@ -468,15 +455,10 @@ H2_SIZE   = 13
 H3_SIZE   = 11.5
 
 H2_BORDER_COLOR = "2563EB"
-H2_BORDER_SIZE  = 24    # 1/8-pt → 3 pt
+H2_BORDER_SIZE  = 24
 
 META_LABEL_FILL  = "EFF6FF"
 META_HEADER_FILL = "F8FAFC"
-
-
-# ─────────────────────────────────────────────────────────────
-# LAYOUT RESOLUTION  (mirrors lib/docLayout.ts exactly)
-# ─────────────────────────────────────────────────────────────
 
 DOC_LAYOUTS: dict = {
     "default":              {"shellVariant": "page",  "showLogo": False, "showSignature": False, "headerImageUrl": None, "footerImageUrl": None},
@@ -520,10 +502,6 @@ def get_layout(template_slug: Optional[str], design_key: Optional[str]) -> dict:
     return DOC_LAYOUTS["default"]
 
 
-# ─────────────────────────────────────────────────────────────
-# DOCX STYLE HELPERS
-# ─────────────────────────────────────────────────────────────
-
 def configure_document_styles(document: Document):
     try:
         n = document.styles["Normal"]
@@ -552,10 +530,6 @@ def set_page_margins(document: Document, top=1.0, bottom=1.0, left=1.0, right=1.
     s.top_margin = s.bottom_margin = s.left_margin = s.right_margin = Inches(top)
 
 
-# ─────────────────────────────────────────────────────────────
-# XML HELPERS
-# ─────────────────────────────────────────────────────────────
-
 def add_left_border(paragraph, color=H2_BORDER_COLOR, size=H2_BORDER_SIZE):
     pPr  = paragraph._p.get_or_add_pPr()
     pBdr = OxmlElement("w:pBdr")
@@ -573,7 +547,7 @@ def shade_cell(cell, fill_hex: str):
 
 
 def remove_cell_borders(cell):
-    tcPr     = cell._tc.get_or_add_tcPr()
+    tcPr      = cell._tc.get_or_add_tcPr()
     tcBorders = OxmlElement("w:tcBorders")
     for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
         b = OxmlElement(f"w:{side}"); b.set(qn("w:val"), "none"); tcBorders.append(b)
@@ -581,16 +555,12 @@ def remove_cell_borders(cell):
 
 
 def add_bottom_border_to_cell(cell, color="334155", size=6):
-    tcPr     = cell._tc.get_or_add_tcPr()
+    tcPr      = cell._tc.get_or_add_tcPr()
     tcBorders = OxmlElement("w:tcBorders")
-    bottom   = OxmlElement("w:bottom")
+    bottom    = OxmlElement("w:bottom")
     bottom.set(qn("w:val"), "single"); bottom.set(qn("w:sz"), str(size)); bottom.set(qn("w:color"), color)
     tcBorders.append(bottom); tcPr.append(tcBorders)
 
-
-# ─────────────────────────────────────────────────────────────
-# IMAGE FETCH
-# ─────────────────────────────────────────────────────────────
 
 def fetch_image(url: Optional[str]) -> Optional[io.BytesIO]:
     if not url:
@@ -607,10 +577,6 @@ def fetch_image(url: Optional[str]) -> Optional[io.BytesIO]:
         print(f"⚠️  fetch_image failed for {url}: {e}")
     return None
 
-
-# ─────────────────────────────────────────────────────────────
-# BRAND HEADER  (mirrors DocumentPageShell header block)
-# ─────────────────────────────────────────────────────────────
 
 def render_brand_header(document: Document, layout: dict, brand: Optional[dict], title: Optional[str]):
     header_img = fetch_image(layout.get("headerImageUrl"))
@@ -629,13 +595,11 @@ def render_brand_header(document: Document, layout: dict, brand: Optional[dict],
     for cell in (left_cell, center_cell, right_cell):
         remove_cell_borders(cell)
 
-    # Logo
     logo_img = fetch_image(brand.get("logoUrl")) if layout.get("showLogo") else None
     if logo_img:
         left_cell.text = ""
         left_cell.paragraphs[0].add_run().add_picture(logo_img, width=Inches(1.2))
 
-    # Company name + address
     center_cell.text = ""
     nr = center_cell.paragraphs[0].add_run(brand.get("companyName", ""))
     nr.bold = True; nr.font.size = Pt(10); nr.font.name = BODY_FONT
@@ -646,7 +610,6 @@ def render_brand_header(document: Document, layout: dict, brand: Optional[dict],
                 r.font.size = Pt(8); r.font.name = BODY_FONT
                 r.font.color.rgb = RGBColor(0x47, 0x55, 0x69)
 
-    # Phone + email
     right_cell.text = ""
     for val in (brand.get("phone"), brand.get("email")):
         if val:
@@ -656,7 +619,6 @@ def render_brand_header(document: Document, layout: dict, brand: Optional[dict],
                 r.font.size = Pt(8); r.font.name = BODY_FONT
                 r.font.color.rgb = RGBColor(0x47, 0x55, 0x69)
 
-    # Document title bar
     if title:
         p = document.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -674,10 +636,6 @@ def render_brand_header(document: Document, layout: dict, brand: Optional[dict],
 
     document.add_paragraph()
 
-
-# ─────────────────────────────────────────────────────────────
-# SIGNATORY FOOTER
-# ─────────────────────────────────────────────────────────────
 
 def render_signatory_footer(document: Document, signatory: Optional[dict]):
     if not signatory:
@@ -717,10 +675,6 @@ def render_footer_banner(document: Document, layout: dict):
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p.paragraph_format.space_before = Pt(12); p.paragraph_format.space_after = Pt(0)
 
-
-# ─────────────────────────────────────────────────────────────
-# TEXT RUNS
-# ─────────────────────────────────────────────────────────────
 
 def add_text_runs_from_tiptap(content_nodes: list, paragraph):
     if not content_nodes:
@@ -765,10 +719,6 @@ def add_text_runs_from_tiptap(content_nodes: list, paragraph):
             if attrs.get("bold"):  run.bold      = True
             if not value:          run.underline = True
 
-
-# ─────────────────────────────────────────────────────────────
-# TABLE RENDERERS
-# ─────────────────────────────────────────────────────────────
 
 def render_meta_table(node, document: Document):
     rows = node.get("content", [])
@@ -824,10 +774,6 @@ def render_table_node(node, document: Document):
                 shade_cell(cell, META_HEADER_FILL)
 
 
-# ─────────────────────────────────────────────────────────────
-# SIGNATURES BLOCK
-# ─────────────────────────────────────────────────────────────
-
 def render_signatures_block(node, document: Document, signatory: Optional[dict]):
     attrs       = node.get("attrs", {}) or {}
     left_title  = attrs.get("leftTitle",  "CLIENT")
@@ -878,10 +824,6 @@ def render_signatures_block(node, document: Document, signatory: Optional[dict])
     _set(table.rows[4].cells[1], "Name / Date", size=9)
 
 
-# ─────────────────────────────────────────────────────────────
-# IMAGE NODE
-# ─────────────────────────────────────────────────────────────
-
 def render_image_node(node, document: Document):
     src = (node.get("attrs") or {}).get("src")
     img = fetch_image(src)
@@ -891,16 +833,9 @@ def render_image_node(node, document: Document):
     apply_body_spacing(p)
 
 
-# ─────────────────────────────────────────────────────────────
-# CORE RENDER DISPATCHER
-# ─────────────────────────────────────────────────────────────
-
 def render_node(node, document: Document, signatory: Optional[dict] = None):
     ntype = node.get("type")
 
-    # ── Heading ───────────────────────────────────────────────────────────────
-    # Match the editor exactly: bold, left-aligned, body font + size.
-    # NO uppercase, NO centering, NO left border, NO size changes.
     if ntype == "heading":
         p = document.add_paragraph()
         add_text_runs_from_tiptap(node.get("content", []), p)
@@ -912,7 +847,6 @@ def render_node(node, document: Document, signatory: Optional[dict] = None):
         apply_body_spacing(p)
         return
 
-    # ── Paragraph ─────────────────────────────────────────────────────────────
     if ntype == "paragraph":
         attrs   = node.get("attrs", {}) or {}
         if attrs.get("instructional"): return
@@ -935,10 +869,6 @@ def render_node(node, document: Document, signatory: Optional[dict] = None):
         elif align == "justify": p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         return
 
-    # ── Bullet list ───────────────────────────────────────────────────────────
-    # First paragraph in each listItem gets the bullet prefix.
-    # Extra paragraphs inside the same listItem are continuation lines
-    # (indented, no bullet) — matches how the editor renders them.
     if ntype == "bulletList":
         for li in node.get("content", []):
             if li.get("type") != "listItem": continue
@@ -966,11 +896,6 @@ def render_node(node, document: Document, signatory: Optional[dict] = None):
                 fmt.line_spacing      = 1.35
         return
 
-    # ── Ordered list ──────────────────────────────────────────────────────────
-    # First paragraph in each listItem gets "N.  " prefix.
-    # Extra paragraphs inside the SAME listItem are continuation/address lines —
-    # they get indentation only, NO number. This prevents address sub-lines
-    # from becoming separate numbered items.
     if ntype == "orderedList":
         idx = 1
         for li in node.get("content", []):
@@ -980,7 +905,6 @@ def render_node(node, document: Document, signatory: Optional[dict] = None):
             for i, child in enumerate(paras):
                 if (child.get("attrs") or {}).get("instructional"): continue
                 content = child.get("content", []) or []
-                # NEW (fixed)
                 if not content:
                     continue
                 has_text = any(c.get("type") == "text" and c.get("text", "").strip() for c in content)
@@ -1029,12 +953,7 @@ def render_node(node, document: Document, signatory: Optional[dict] = None):
         pPr = p._p.get_or_add_pPr()
         pb  = OxmlElement("w:pageBreakBefore"); pb.set(qn("w:val"), "true"); pPr.append(pb)
         return
-    # unknown nodes: silently skip
 
-
-# ─────────────────────────────────────────────────────────────
-# MAIN DOCX CONVERTER
-# ─────────────────────────────────────────────────────────────
 
 def tiptap_doc_to_docx(
     tiptap_doc:    Optional[dict],
@@ -1075,8 +994,6 @@ def sanitize_filename(name: str) -> str:
 # =============================================================
 # ░░░░  SECTION 3 — ALL ROUTES  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 # =============================================================
-
-# ── OCR / Job routes (unchanged) ─────────────────────────────
 
 class ProcessRequest(BaseModel):
     jobId: str
@@ -1185,20 +1102,14 @@ async def parse_document_route(
         raise HTTPException(status_code=500, detail="PROCESSING_FAILED")
 
 
-# ── DOCX Export route (merged from flask_docx.py) ────────────
-#
-# Called by Next.js:  app/api/export-docx/route.ts
-# env:  FLASK_DOCX_URL=http://localhost:8000/generate-docx
-# ─────────────────────────────────────────────────────────────
-
 class GenerateDocxRequest(BaseModel):
     contentJson:  Any           = None
     fileName:     Optional[str] = Field(default="document")
     templateSlug: Optional[str] = None
     designKey:    Optional[str] = None
-    brand:        Optional[Any] = None   # BrandProfile | null
-    signatory:    Optional[Any] = None   # SignatoryProfile | null
-    baseTemplate: Optional[str] = None   # reserved for future use
+    brand:        Optional[Any] = None
+    signatory:    Optional[Any] = None
+    baseTemplate: Optional[str] = None
 
 
 @app.post("/generate-docx")
@@ -1232,10 +1143,6 @@ async def generate_docx_route(payload: GenerateDocxRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ─────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
