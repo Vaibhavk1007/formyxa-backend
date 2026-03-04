@@ -49,8 +49,8 @@ load_dotenv()
 ENGINE_VERSION     = "v2.0.0"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
-# MODEL = os.getenv("OCR_MODEL", "google/gemini-2.0-flash-001")
-MODEL = os.getenv("OCR_MODEL", "anthropic/claude-3-5-sonnet")
+MODEL = os.getenv("OCR_MODEL", "google/gemini-2.0-flash-001")
+# MODEL = os.getenv("OCR_MODEL", "anthropic/claude-3-5-sonnet")
 MAX_PDF_PAGES      = 20
 
 OCR_HEADERS = {
