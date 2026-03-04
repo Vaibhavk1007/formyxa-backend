@@ -49,7 +49,7 @@ load_dotenv()
 ENGINE_VERSION     = "v2.0.0"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "openai/gpt-4o"
+MODEL = os.getenv("OCR_MODEL", "google/gemini-2.0-flash-001")
 MAX_PDF_PAGES      = 20
 
 OCR_HEADERS = {
@@ -254,7 +254,7 @@ EXTRACTED TEXT:
 {raw_text}"""
 
     payload2 = {
-        "model": "openai/gpt-4o",
+        "model": MODEL,
         "temperature": 0,
         "max_tokens": 4000,
         "messages": [
